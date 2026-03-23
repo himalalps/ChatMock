@@ -213,6 +213,37 @@ class RouteTests(unittest.TestCase):
         self.assertIsInstance(outbound_payload["prompt_cache_key"], str)
 
     @patch("chatmock.routes_openai.start_upstream_raw_request")
+    def test_responses_route_ignores_max_output_tokens(self, mock_start) -> None:
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {
+                        "type": "response.created",
+                        "response": {"id": "resp_123", "object": "response", "status": "in_progress"},
+                    },
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_123",
+                            "object": "response",
+                            "status": "completed",
+                            "output": [],
+                        },
+                    },
+                ],
+                headers={"Content-Type": "text/event-stream"},
+            ),
+            None,
+        )
+        response = self.client.post(
+            "/v1/responses",
+            json={"model": "gpt5.4-mini", "input": "hello", "max_output_tokens": 123},
+        )
+        self.assertEqual(response.status_code, 200)
+        outbound_payload = mock_start.call_args.args[0]
+        self.assertNotIn("max_output_tokens", outbound_payload)
+
+    @patch("chatmock.routes_openai.start_upstream_raw_request")
     def test_responses_route_does_not_use_previous_response_id_for_http_follow_up(self, mock_start) -> None:
         mock_start.side_effect = [
             (
