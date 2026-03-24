@@ -16,6 +16,9 @@ from .reasoning import build_reasoning_param
 from .session import ensure_session_id
 
 
+_ANTHROPIC_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+
+
 @dataclass(frozen=True)
 class ResponsesRequestError(Exception):
     message: str
@@ -77,6 +80,15 @@ def canonicalize_responses_input(raw_input: Any) -> Any:
     return raw_input
 
 
+def sanitize_instructions_for_upstream(instructions: Any) -> Any:
+    if not isinstance(instructions, str):
+        return instructions
+    if not instructions.startswith(_ANTHROPIC_BILLING_HEADER_PREFIX):
+        return instructions
+    _first_line, separator, remainder = instructions.partition("\n")
+    return remainder.strip() if separator else ""
+
+
 def normalize_responses_payload(
     payload: Dict[str, Any],
     *,
@@ -89,6 +101,7 @@ def normalize_responses_payload(
     normalized = dict(payload)
     normalized["model"] = normalized_model
     normalized.pop("max_output_tokens", None)
+    normalized.pop("temperature", None)
 
     if "input" in normalized:
         normalized["input"] = canonicalize_responses_input(normalized.get("input"))
@@ -99,7 +112,8 @@ def normalize_responses_payload(
     instructions = normalized.get("instructions")
     if not isinstance(instructions, str) or not instructions.strip():
         instructions = instructions_for_model(config, normalized_model)
-        normalized["instructions"] = instructions
+    instructions = sanitize_instructions_for_upstream(instructions)
+    normalized["instructions"] = instructions
 
     reasoning_effort = config.get("REASONING_EFFORT", "medium")
     reasoning_summary = config.get("REASONING_SUMMARY", "auto")

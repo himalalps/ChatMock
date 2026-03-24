@@ -21,6 +21,11 @@ _RESPONSES_ORDER: List[str] = []
 class PreparedResponsesRequest:
     payload: Dict[str, Any]
     session_id: str
+    full_payload: Dict[str, Any]
+    input_delta: List[Dict[str, Any]]
+    is_follow_up: bool
+    previous_response_id: str | None
+    explicit_previous_response_id: bool
 
 
 @dataclass
@@ -176,6 +181,9 @@ def prepare_responses_request_for_session(
         isinstance(full_payload.get("previous_response_id"), str)
         and bool(full_payload.get("previous_response_id").strip())
     )
+    previous_response_id: str | None = None
+    is_follow_up = False
+    input_delta = _input_list(full_payload) or []
 
     with _LOCK:
         state = _remember_responses_session(session_id)
@@ -185,6 +193,11 @@ def prepare_responses_request_for_session(
             return PreparedResponsesRequest(
                 payload=outbound_payload,
                 session_id=session_id,
+                full_payload=full_payload,
+                input_delta=input_delta,
+                is_follow_up=True,
+                previous_response_id=full_payload.get("previous_response_id"),
+                explicit_previous_response_id=True,
             )
 
         request_input = _input_list(full_payload)
@@ -203,8 +216,11 @@ def prepare_responses_request_for_session(
             baseline.extend(copy.deepcopy(state.last_response_items))
             baseline_len = len(baseline)
             if request_input[:baseline_len] == baseline and baseline_len <= len(request_input):
-                outbound_payload["input"] = copy.deepcopy(request_input[baseline_len:])
+                input_delta = copy.deepcopy(request_input[baseline_len:])
+                outbound_payload["input"] = copy.deepcopy(input_delta)
                 outbound_payload["previous_response_id"] = state.last_response_id
+                previous_response_id = state.last_response_id
+                is_follow_up = True
 
         state.inflight_request_payload = full_payload
         state.inflight_track_result = True
@@ -214,6 +230,11 @@ def prepare_responses_request_for_session(
     return PreparedResponsesRequest(
         payload=outbound_payload,
         session_id=session_id,
+        full_payload=full_payload,
+        input_delta=input_delta,
+        is_follow_up=is_follow_up,
+        previous_response_id=previous_response_id,
+        explicit_previous_response_id=False,
     )
 
 

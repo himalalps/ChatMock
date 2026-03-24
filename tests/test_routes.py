@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
+import tempfile
 import threading
 import time
 import unittest
@@ -51,8 +53,23 @@ class FakeUpstream:
 class RouteTests(unittest.TestCase):
     def setUp(self) -> None:
         reset_session_state()
+        self._temp_home = tempfile.TemporaryDirectory()
+        self._previous_chatgpt_local_home = os.environ.get("CHATGPT_LOCAL_HOME")
+        os.environ["CHATGPT_LOCAL_HOME"] = self._temp_home.name
         self.app = create_app()
         self.client = self.app.test_client()
+
+    def tearDown(self) -> None:
+        if self._previous_chatgpt_local_home is None:
+            os.environ.pop("CHATGPT_LOCAL_HOME", None)
+        else:
+            os.environ["CHATGPT_LOCAL_HOME"] = self._previous_chatgpt_local_home
+        self._temp_home.cleanup()
+
+    def _read_session_log(self, session_id: str) -> list[dict[str, object]]:
+        path = os.path.join(self._temp_home.name, "sessions", f"{session_id}.jsonl")
+        with open(path, "r", encoding="utf-8") as fp:
+            return [json.loads(line) for line in fp if line.strip()]
 
     def test_openai_models_list(self) -> None:
         response = self.client.get("/v1/models")
@@ -213,6 +230,41 @@ class RouteTests(unittest.TestCase):
         self.assertIsInstance(outbound_payload["prompt_cache_key"], str)
 
     @patch("chatmock.routes_openai.start_upstream_raw_request")
+    def test_responses_route_drops_anthropic_billing_header_line_from_instructions(self, mock_start) -> None:
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {
+                        "type": "response.created",
+                        "response": {"id": "resp_123", "object": "response", "status": "in_progress"},
+                    },
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_123",
+                            "object": "response",
+                            "status": "completed",
+                            "output": [],
+                        },
+                    },
+                ],
+                headers={"Content-Type": "text/event-stream"},
+            ),
+            None,
+        )
+        response = self.client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt5.4-mini",
+                "input": "hello",
+                "instructions": "x-anthropic-billing-header: cc_version=1\nreal instructions\nmore",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        outbound_payload = mock_start.call_args.args[0]
+        self.assertEqual(outbound_payload["instructions"], "real instructions\nmore")
+
+    @patch("chatmock.routes_openai.start_upstream_raw_request")
     def test_responses_route_ignores_max_output_tokens(self, mock_start) -> None:
         mock_start.return_value = (
             FakeUpstream(
@@ -289,7 +341,11 @@ class RouteTests(unittest.TestCase):
             ),
         ]
 
-        first = self.client.post("/v1/responses", json={"model": "gpt-5.4", "input": "hello"})
+        first = self.client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.4", "input": "hello"},
+            headers={"X-Session-Id": "session-fixed"},
+        )
         second = self.client.post(
             "/v1/responses",
             json={
@@ -300,6 +356,7 @@ class RouteTests(unittest.TestCase):
                     {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second"}]},
                 ],
             },
+            headers={"X-Session-Id": "session-fixed"},
         )
 
         self.assertEqual(first.status_code, 200)
@@ -308,6 +365,25 @@ class RouteTests(unittest.TestCase):
         self.assertNotIn("previous_response_id", outbound_payload)
         self.assertEqual(
             outbound_payload["input"],
+            [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+                {"type": "message", "role": "assistant", "id": "msg_1", "content": [{"type": "output_text", "text": "assistant output"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second"}]},
+            ],
+        )
+        records = self._read_session_log("session-fixed")
+        self.assertEqual(len(records), 2)
+        self.assertFalse(records[0]["is_follow_up"])
+        self.assertEqual(records[0]["model"], "gpt-5.4")
+        self.assertIsNotNone(records[0]["instructions"])
+        self.assertEqual(
+            records[0]["input_delta"],
+            [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        )
+        self.assertFalse(records[1]["is_follow_up"])
+        self.assertEqual(records[1]["model"], "gpt-5.4")
+        self.assertEqual(
+            records[1]["input_delta"],
             [
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
                 {"type": "message", "role": "assistant", "id": "msg_1", "content": [{"type": "output_text", "text": "assistant output"}]},
@@ -454,7 +530,32 @@ class RouteTests(unittest.TestCase):
         )
 
     @patch("chatmock.routes_openai.start_upstream_raw_request")
-    def test_responses_route_stream_passthrough(self, mock_start) -> None:
+    def test_responses_route_logs_failure_record(self, mock_start) -> None:
+        mock_start.return_value = (
+            FakeUpstream(
+                [{"type": "response.failed", "response": {"error": {"message": "boom"}}}],
+                headers={"Content-Type": "text/event-stream"},
+            ),
+            None,
+        )
+
+        response = self.client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.4", "input": "hello"},
+            headers={"X-Session-Id": "session-failure"},
+        )
+
+        self.assertEqual(response.status_code, 502)
+        records = self._read_session_log("session-failure")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "failed")
+        self.assertEqual(records[0]["model"], "gpt-5.4")
+        self.assertIsNotNone(records[0]["instructions"])
+        self.assertEqual(
+            records[0]["input_delta"],
+            [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        )
+
         chunk = b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n'
         mock_start.return_value = (
             FakeUpstream(
@@ -536,7 +637,10 @@ class RouteTests(unittest.TestCase):
         server_thread.start()
         time.sleep(0.5)
 
-        with ws_connect(f"ws://{host}:{port}/v1/responses") as client:
+        with ws_connect(
+            f"ws://{host}:{port}/v1/responses",
+            additional_headers={"X-Session-Id": "ws-session-fixed"},
+        ) as client:
             client.send(json.dumps({"type": "response.create", "model": "gpt-5.4", "input": "hello", "fast_mode": True}))
             first = json.loads(client.recv())
             assistant = json.loads(client.recv())
@@ -576,6 +680,19 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(follow_up["previous_response_id"], "resp_ws_1")
         self.assertEqual(
             follow_up["input"],
+            [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second"}]}],
+        )
+        records = self._read_session_log("ws-session-fixed")
+        self.assertEqual(len(records), 2)
+        self.assertFalse(records[0]["is_follow_up"])
+        self.assertEqual(records[0]["model"], "gpt-5.4")
+        self.assertIsNotNone(records[0]["instructions"])
+        self.assertTrue(records[1]["is_follow_up"])
+        self.assertEqual(records[1]["model"], "gpt-5.4")
+        self.assertEqual(records[1]["previous_response_id"], "resp_ws_1")
+        self.assertIsNotNone(records[1]["instructions"])
+        self.assertEqual(
+            records[1]["input_delta"],
             [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second"}]}],
         )
 

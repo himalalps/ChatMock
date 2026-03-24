@@ -21,6 +21,11 @@ from .session import (
     note_responses_stream_event,
     prepare_responses_request_for_session,
 )
+from .session_archive import (
+    append_responses_turn_failure,
+    create_pending_responses_turn,
+    note_responses_turn_event,
+)
 from .upstream import build_upstream_headers, build_upstream_websocket_url
 from .utils import get_effective_chatgpt_auth
 
@@ -74,6 +79,7 @@ def register_websocket_routes(sock: Sock) -> None:
         upstream_ws = None
         upstream_session_id: str | None = None
         active_session_id: str | None = None
+        pending_turn = None
 
         def _send_error(message: str, *, status_code: int = 400, code: str | None = None) -> None:
             evt = _error_event(message, status_code=status_code, code=code)
@@ -129,6 +135,7 @@ def register_websocket_routes(sock: Sock) -> None:
                         normalized.payload,
                         allow_previous_response_id=True,
                     )
+                    pending_turn = create_pending_responses_turn(prepared, transport="websocket")
                     outbound_text = json.dumps(prepared.payload)
                     session_id = normalized.session_id
                     active_session_id = normalized.session_id
@@ -145,6 +152,7 @@ def register_websocket_routes(sock: Sock) -> None:
                     access_token, account_id = get_effective_chatgpt_auth()
                     if not access_token or not account_id:
                         if session_id:
+                            append_responses_turn_failure(pending_turn, {"error": {"message": "Missing ChatGPT credentials. Run 'python3 chatmock.py login' first."}})
                             clear_responses_reuse_state(session_id)
                         _send_error(
                             "Missing ChatGPT credentials. Run 'python3 chatmock.py login' first.",
@@ -171,6 +179,7 @@ def register_websocket_routes(sock: Sock) -> None:
                         )
                     except Exception as exc:
                         if session_id:
+                            append_responses_turn_failure(pending_turn, {"error": {"message": f"Upstream websocket connection failed: {exc}"}})
                             clear_responses_reuse_state(session_id)
                         _send_error(
                             f"Upstream websocket connection failed: {exc}",
@@ -186,11 +195,13 @@ def register_websocket_routes(sock: Sock) -> None:
                         upstream_message = upstream_ws.recv()
                     except ConnectionClosed:
                         if active_session_id:
+                            append_responses_turn_failure(pending_turn, {"error": {"message": "Upstream websocket closed unexpectedly."}})
                             clear_responses_reuse_state(active_session_id)
                         _send_error("Upstream websocket closed unexpectedly.", status_code=502)
                         return
                     if upstream_message is None:
                         if active_session_id:
+                            append_responses_turn_failure(pending_turn, {"error": {"message": "Upstream websocket closed unexpectedly."}})
                             clear_responses_reuse_state(active_session_id)
                         _send_error("Upstream websocket closed unexpectedly.", status_code=502)
                         return
@@ -207,6 +218,7 @@ def register_websocket_routes(sock: Sock) -> None:
                         parsed = None
                     if isinstance(parsed, dict) and active_session_id:
                         note_responses_stream_event(active_session_id, parsed)
+                        note_responses_turn_event(pending_turn, parsed)
                     if _is_terminal_event(parsed):
                         if isinstance(parsed, dict) and parsed.get("type") in ("response.failed", "error"):
                             if upstream_ws is not None:

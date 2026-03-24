@@ -31,6 +31,12 @@ from .session import (
     note_responses_stream_event,
     prepare_responses_request_for_session,
 )
+from .session_archive import (
+    append_responses_turn_failure,
+    append_responses_turn_success,
+    create_pending_responses_turn,
+    note_responses_turn_event,
+)
 from .upstream import normalize_model_name, start_upstream_raw_request, start_upstream_request
 from .utils import (
     convert_chat_messages_to_responses_input,
@@ -619,6 +625,7 @@ def responses_create() -> Response:
         normalized.payload,
         allow_previous_response_id=False,
     )
+    pending_turn = create_pending_responses_turn(prepared, transport="http")
     stream_req = bool(prepared.payload.get("stream", False))
     upstream_payload = dict(prepared.payload)
     upstream_payload["stream"] = True
@@ -628,6 +635,7 @@ def responses_create() -> Response:
         stream=True,
     )
     if error_resp is not None:
+        append_responses_turn_failure(pending_turn, {"message": "upstream request failed to start"})
         clear_responses_reuse_state(normalized.session_id)
         if verbose:
             try:
@@ -651,6 +659,7 @@ def responses_create() -> Response:
             err_body = {"error": {"message": upstream.text or "Upstream error"}}
         finally:
             upstream.close()
+        append_responses_turn_failure(pending_turn, err_body)
         clear_responses_reuse_state(normalized.session_id)
         if verbose:
             _log_json("OUT POST /v1/responses", err_body)
@@ -666,7 +675,10 @@ def responses_create() -> Response:
             "STREAM OUT /v1/responses",
             stream_upstream_bytes(
                 upstream,
-                on_event=lambda evt: note_responses_stream_event(normalized.session_id, evt),
+                on_event=lambda evt: (
+                    note_responses_stream_event(normalized.session_id, evt),
+                    note_responses_turn_event(pending_turn, evt),
+                ),
             ),
             verbose,
         )
@@ -690,6 +702,7 @@ def responses_create() -> Response:
             upstream.close()
         if isinstance(body, dict):
             note_responses_final_response(normalized.session_id, body)
+            append_responses_turn_success(pending_turn, body)
             if verbose:
                 _log_json("OUT POST /v1/responses", body)
             resp = make_response(jsonify(body), upstream.status_code)
@@ -699,9 +712,13 @@ def responses_create() -> Response:
 
     response_obj, error_obj = aggregate_response_from_sse(
         upstream,
-        on_event=lambda evt: note_responses_stream_event(normalized.session_id, evt),
+        on_event=lambda evt: (
+            note_responses_stream_event(normalized.session_id, evt),
+            note_responses_turn_event(pending_turn, evt),
+        ),
     )
     if error_obj is not None:
+        append_responses_turn_failure(pending_turn, error_obj)
         clear_responses_reuse_state(normalized.session_id)
         if verbose:
             _log_json("OUT POST /v1/responses", error_obj)
@@ -711,6 +728,7 @@ def responses_create() -> Response:
         return resp
 
     if response_obj is None:
+        append_responses_turn_failure(pending_turn, {"error": {"message": "Upstream response stream did not contain a completed response object"}})
         clear_responses_reuse_state(normalized.session_id)
         err = {"error": {"message": "Upstream response stream did not contain a completed response object"}}
         if verbose:
@@ -720,6 +738,7 @@ def responses_create() -> Response:
             resp.headers.setdefault(k, v)
         return resp
 
+    append_responses_turn_success(pending_turn, response_obj)
     if verbose:
         _log_json("OUT POST /v1/responses", response_obj)
     resp = make_response(jsonify(response_obj), upstream.status_code)
