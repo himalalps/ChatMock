@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 from pathlib import Path
 
@@ -140,14 +141,23 @@ def trim_replayed_tool_items(previous_output_delta, current_input_delta):
     return trimmed
 
 
-def derive_input_delta(records, index):
+def derive_input_delta(records, index, previous_record=None):
     current_input = records[index].get("input_delta")
-    if index == 0 or not isinstance(current_input, list):
+    if not isinstance(current_input, list):
         return current_input
 
-    previous_record = records[index - 1]
-    current_input = trim_list_prefix(previous_record.get("input_delta"), current_input)
-    return trim_replayed_tool_items(previous_record.get("output_delta"), current_input)
+    if index == 0:
+        if previous_record is None:
+            return current_input
+        base_input = previous_record.get("input_delta")
+        base_output = previous_record.get("output_delta")
+    else:
+        previous_record = records[index - 1]
+        base_input = previous_record.get("input_delta")
+        base_output = previous_record.get("output_delta")
+
+    current_input = trim_list_prefix(base_input, current_input)
+    return trim_replayed_tool_items(base_output, current_input)
 
 
 def strip_redundant_fields(record, input_delta, keep_instructions):
@@ -171,6 +181,41 @@ def sort_key(obj):
         obj.get("_source_file", obj.get("source_file", "")),
         obj.get("_line_no", obj.get("line_no", 0)),
     )
+
+
+def load_archived_groups():
+    groups = []
+
+    for path in sorted(OUTPUT_DIR.glob("*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except json.JSONDecodeError:
+            continue
+
+        merge_state = payload.get("merge_state")
+        if not isinstance(merge_state, dict):
+            continue
+
+        last_record = merge_state.get("last_record")
+        if not isinstance(last_record, dict):
+            continue
+
+        last_record = remove_encrypted_content(last_record)
+        last_record["_source_file"] = path.name
+        last_record["_line_no"] = merge_state.get("last_line_no", 0)
+        last_record["_user_text"] = extract_user_text(last_record.get("input_delta"))
+        groups.append({
+            "group_id": payload.get("group_id", len(groups) + 1),
+            "base_user_text": payload.get("base_user_text", ""),
+            "latest_user_text": merge_state.get("latest_user_text", last_record.get("_user_text", "")),
+            "records": [last_record],
+            "archived_path": path,
+            "existing_payload": payload,
+            "is_archived_seed": True,
+        })
+
+    return groups
 
 
 def load_records():
@@ -203,8 +248,8 @@ def load_records():
     return sorted(records, key=sort_key)
 
 
-def assign_groups(records):
-    groups = []
+def assign_groups(records, archived_groups=None):
+    groups = list(archived_groups or [])
 
     for record in records:
         user_text = record.get("_user_text", "")
@@ -230,23 +275,47 @@ def assign_groups(records):
                 "base_user_text": user_text,
                 "latest_user_text": user_text,
                 "records": [record],
+                "archived_path": None,
+                "existing_payload": None,
+                "is_archived_seed": False,
             })
 
     return groups
 
 
+def build_merge_state(group):
+    last_record = dict(group["records"][-1])
+    last_record.pop("_user_text", None)
+    last_record.pop("_source_file", None)
+    last_record.pop("_line_no", None)
+    return {
+        "latest_user_text": group.get("latest_user_text", ""),
+        "last_line_no": group["records"][-1].get("_line_no", 0),
+        "last_record": last_record,
+    }
+
+
 def build_group_payload(group):
+    existing_payload = group.get("existing_payload") or {}
+    existing_steps = list(existing_payload.get("steps", []))
     records = group["records"]
+    seed_count = 1 if group.get("is_archived_seed") else 0
+    new_records = records[seed_count:]
     first = records[0]
     base_user_text = group.get("base_user_text", "")
     merged_steps = []
-    instructions_seen = False
+    instructions_seen = any(
+        isinstance(step, dict) and "instructions" in step.get("record", {})
+        for step in existing_steps
+    )
 
-    for idx, record in enumerate(records, 1):
+    for offset, record in enumerate(new_records, len(existing_steps) + 1):
         current_user_text = record.get("_user_text", "")
         user_suffix = trim_duplicate_prefix(base_user_text, current_user_text)
         keep_instructions = not instructions_seen and "instructions" in record
-        input_delta = derive_input_delta(records, idx - 1)
+        record_index = seed_count + (offset - len(existing_steps) - 1)
+        previous_record = records[0] if group.get("is_archived_seed") and record_index == seed_count else None
+        input_delta = derive_input_delta(records, record_index, previous_record=previous_record)
         cleaned_record = strip_redundant_fields(
             record,
             input_delta=input_delta,
@@ -255,20 +324,26 @@ def build_group_payload(group):
         if keep_instructions:
             instructions_seen = True
         merged_steps.append({
-            "step": idx,
+            "step": offset,
             "source_file": record.get("_source_file", record.get("source_file", "")),
             "user_text_suffix": user_suffix,
             "record": cleaned_record,
         })
 
+    all_steps = existing_steps + merged_steps
+    last_record = records[-1]
+    first_session_id = existing_payload.get("first_session_id") or first.get("session_id", "")
+    first_ts = existing_payload.get("first_ts") or first.get("ts", "")
+
     return {
         "group_id": group["group_id"],
         "base_user_text": base_user_text,
-        "record_count": len(records),
-        "first_ts": first.get("ts", ""),
-        "last_ts": records[-1].get("ts", ""),
-        "first_session_id": first.get("session_id", ""),
-        "steps": merged_steps,
+        "record_count": len(all_steps),
+        "first_ts": first_ts,
+        "last_ts": last_record.get("ts", existing_payload.get("last_ts", "")),
+        "first_session_id": first_session_id,
+        "steps": all_steps,
+        "merge_state": build_merge_state(group),
     }
 
 
@@ -276,6 +351,8 @@ def write_group_files(groups):
     merged_source_files = set()
 
     for group in groups:
+        if group.get("is_archived_seed") and len(group.get("records", [])) == 1:
+            continue
         payload = build_group_payload(group)
         first_session_id = payload.get("first_session_id") or f"group_{group['group_id']:03d}"
         filename = f"{first_session_id}.json"
@@ -285,7 +362,7 @@ def write_group_files(groups):
         merged_source_files.update(
             step.get("source_file")
             for step in payload.get("steps", [])
-            if step.get("source_file")
+            if step.get("source_file") and step.get("source_file", "").endswith(".jsonl")
         )
 
     return merged_source_files
@@ -298,14 +375,23 @@ def delete_source_files(source_files):
             path.unlink()
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--delete-source-files", action="store_true")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    archived_groups = load_archived_groups()
     records = load_records()
-    groups = assign_groups(records)
+    groups = assign_groups(records, archived_groups=archived_groups)
     merged_source_files = write_group_files(groups)
-    delete_source_files(merged_source_files)
+    if args.delete_source_files:
+        delete_source_files(merged_source_files)
     print(f"Wrote group files to: {OUTPUT_DIR}")
-    print(f"Deleted source files: {len(merged_source_files)}")
+    print(f"Deleted source files: {len(merged_source_files) if args.delete_source_files else 0}")
     print(f"Total records: {len(records)}")
     print(f"Total groups: {len(groups)}")
 
