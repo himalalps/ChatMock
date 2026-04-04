@@ -13,7 +13,7 @@ from .http import build_cors_headers
 from .model_registry import normalize_model_name
 from .session import ensure_session_id
 from flask import request as flask_request
-from .utils import get_effective_chatgpt_auth
+from .utils import get_auth_context, get_effective_chatgpt_auth
 
 
 def _log_json(prefix: str, payload: Any) -> None:
@@ -24,6 +24,14 @@ def _log_json(prefix: str, payload: Any) -> None:
             print(f"{prefix}\n{payload}")
         except Exception:
             pass
+
+def _current_auth_profile() -> str | None:
+    try:
+        value = current_app.config.get("AUTH_PROFILE")
+    except Exception:
+        value = None
+    return value if isinstance(value, str) and value.strip() else None
+
 
 def start_upstream_request(
     model: str,
@@ -36,7 +44,8 @@ def start_upstream_request(
     reasoning_param: Dict[str, Any] | None = None,
     service_tier: str | None = None,
 ):
-    access_token, account_id = get_effective_chatgpt_auth()
+    auth_profile = _current_auth_profile()
+    access_token, account_id = get_effective_chatgpt_auth(profile_name=auth_profile)
     if not access_token or not account_id:
         resp = make_response(
             jsonify(
@@ -65,7 +74,12 @@ def start_upstream_request(
         )
     except Exception:
         client_session_id = None
-    session_id = ensure_session_id(instructions, input_items, client_session_id)
+    session_id = ensure_session_id(
+        instructions,
+        input_items,
+        client_session_id,
+        auth_context=get_auth_context(auth_profile),
+    )
 
     responses_payload = {
         "model": model,
@@ -116,7 +130,8 @@ def start_upstream_raw_request(
     session_id: str | None = None,
     stream: bool = True,
 ):
-    access_token, account_id = get_effective_chatgpt_auth()
+    auth_profile = _current_auth_profile()
+    access_token, account_id = get_effective_chatgpt_auth(profile_name=auth_profile)
     if not access_token or not account_id:
         resp = make_response(
             jsonify(

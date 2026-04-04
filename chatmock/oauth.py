@@ -15,7 +15,7 @@ import certifi
 
 from .config import OAUTH_ISSUER_DEFAULT
 from .models import AuthBundle, PkceCodes, TokenData
-from .utils import eprint, generate_pkce, parse_jwt_claims, write_auth_file
+from .utils import eprint, generate_pkce, parse_jwt_claims, write_auth_file, write_auth_profile
 
 
 REQUIRED_PORT = 1455
@@ -48,11 +48,13 @@ class OAuthHTTPServer(http.server.HTTPServer):
         *,
         home_dir: str,
         client_id: str,
+        profile_name: str | None = None,
         verbose: bool = False,
     ) -> None:
         super().__init__(server_address, request_handler_class, bind_and_activate=True)
         self.exit_code = 1
         self.home_dir = home_dir
+        self.profile_name = profile_name.strip() if isinstance(profile_name, str) and profile_name.strip() else None
         self.verbose = verbose
         self.issuer = DEFAULT_ISSUER
         self.token_endpoint = f"{self.issuer}/oauth/token"
@@ -193,6 +195,8 @@ class OAuthHTTPServer(http.server.HTTPServer):
             },
             "last_refresh": bundle.last_refresh,
         }
+        if self.profile_name is not None:
+            return write_auth_profile(self.profile_name, auth_json_contents, set_active=True)
         return write_auth_file(auth_json_contents)
 
 
@@ -231,17 +235,7 @@ class OAuthHandler(http.server.BaseHTTPRequestHandler):
             self._shutdown()
             return
 
-        auth_json_contents = {
-            "OPENAI_API_KEY": auth_bundle.api_key,
-            "tokens": {
-                "id_token": auth_bundle.token_data.id_token,
-                "access_token": auth_bundle.token_data.access_token,
-                "refresh_token": auth_bundle.token_data.refresh_token,
-                "account_id": auth_bundle.token_data.account_id,
-            },
-            "last_refresh": auth_bundle.last_refresh,
-        }
-        if write_auth_file(auth_json_contents):
+        if self.server.persist_auth(auth_bundle):
             self.server.exit_code = 0
             self._send_html(LOGIN_SUCCESS_HTML)
         else:
