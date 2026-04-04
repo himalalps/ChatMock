@@ -81,6 +81,14 @@ def _fingerprint(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def _fingerprint_key(auth_context: str, fingerprint: str) -> str:
+    return f"{auth_context}\n{fingerprint}"
+
+
+def _session_state_key(auth_context: str, session_id: str) -> str:
+    return f"{auth_context}\n{session_id}"
+
+
 def _remember(fp: str, sid: str) -> None:
     if fp in _FINGERPRINT_TO_UUID:
         return
@@ -91,12 +99,13 @@ def _remember(fp: str, sid: str) -> None:
         _FINGERPRINT_TO_UUID.pop(oldest, None)
 
 
-def _remember_responses_session(session_id: str) -> _ResponsesSessionState:
-    state = _RESPONSES_SESSION_STATE.get(session_id)
+def _remember_responses_session(auth_context: str, session_id: str) -> _ResponsesSessionState:
+    state_key = _session_state_key(auth_context, session_id)
+    state = _RESPONSES_SESSION_STATE.get(state_key)
     if state is None:
         state = _ResponsesSessionState()
-        _RESPONSES_SESSION_STATE[session_id] = state
-        _RESPONSES_ORDER.append(session_id)
+        _RESPONSES_SESSION_STATE[state_key] = state
+        _RESPONSES_ORDER.append(state_key)
         if len(_RESPONSES_ORDER) > _MAX_ENTRIES:
             oldest = _RESPONSES_ORDER.pop(0)
             _RESPONSES_SESSION_STATE.pop(oldest, None)
@@ -150,12 +159,14 @@ def ensure_session_id(
     instructions: str | None,
     input_items: List[Dict[str, Any]],
     client_supplied: str | None = None,
+    *,
+    auth_context: str = "anonymous",
 ) -> str:
     if isinstance(client_supplied, str) and client_supplied.strip():
         return client_supplied.strip()
 
     canon = canonicalize_prefix(instructions, input_items)
-    fp = _fingerprint(canon)
+    fp = _fingerprint_key(auth_context, _fingerprint(canon))
     with _LOCK:
         if fp in _FINGERPRINT_TO_UUID:
             return _FINGERPRINT_TO_UUID[fp]
@@ -169,6 +180,7 @@ def prepare_responses_request_for_session(
     payload: Dict[str, Any],
     *,
     allow_previous_response_id: bool = True,
+    auth_context: str = "anonymous",
 ) -> PreparedResponsesRequest:
     full_payload = copy.deepcopy(payload)
     outbound_payload = copy.deepcopy(payload)
@@ -178,7 +190,7 @@ def prepare_responses_request_for_session(
     )
 
     with _LOCK:
-        state = _remember_responses_session(session_id)
+        state = _remember_responses_session(auth_context, session_id)
 
         if explicit_previous_response_id:
             _clear_reuse_state(state)
@@ -217,14 +229,14 @@ def prepare_responses_request_for_session(
     )
 
 
-def note_responses_stream_event(session_id: str, event: Dict[str, Any]) -> None:
+def note_responses_stream_event(session_id: str, event: Dict[str, Any], *, auth_context: str = "anonymous") -> None:
     if not isinstance(session_id, str) or not session_id.strip():
         return
     if not isinstance(event, dict):
         return
 
     with _LOCK:
-        state = _RESPONSES_SESSION_STATE.get(session_id)
+        state = _RESPONSES_SESSION_STATE.get(_session_state_key(auth_context, session_id))
         if state is None:
             return
 
@@ -269,14 +281,19 @@ def note_responses_stream_event(session_id: str, event: Dict[str, Any]) -> None:
             _clear_reuse_state(state)
 
 
-def note_responses_final_response(session_id: str, response_obj: Dict[str, Any]) -> None:
+def note_responses_final_response(
+    session_id: str,
+    response_obj: Dict[str, Any],
+    *,
+    auth_context: str = "anonymous",
+) -> None:
     if not isinstance(session_id, str) or not session_id.strip():
         return
     if not isinstance(response_obj, dict):
         return
 
     with _LOCK:
-        state = _RESPONSES_SESSION_STATE.get(session_id)
+        state = _RESPONSES_SESSION_STATE.get(_session_state_key(auth_context, session_id))
         if state is None:
             return
 
@@ -294,11 +311,11 @@ def note_responses_final_response(session_id: str, response_obj: Dict[str, Any])
         _clear_inflight(state)
 
 
-def clear_responses_reuse_state(session_id: str) -> None:
+def clear_responses_reuse_state(session_id: str, *, auth_context: str = "anonymous") -> None:
     if not isinstance(session_id, str) or not session_id.strip():
         return
     with _LOCK:
-        state = _RESPONSES_SESSION_STATE.get(session_id)
+        state = _RESPONSES_SESSION_STATE.get(_session_state_key(auth_context, session_id))
         if state is None:
             return
         _clear_reuse_state(state)

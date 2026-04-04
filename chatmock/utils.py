@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import datetime
 import hashlib
 import json
@@ -14,6 +15,11 @@ import requests
 from .config import CLIENT_ID_DEFAULT, OAUTH_TOKEN_URL
 
 
+_AUTH_FILENAME = "auth.json"
+_AUTH_VERSION = 2
+_DEFAULT_PROFILE = "default"
+
+
 def eprint(*args, **kwargs) -> None:
     print(*args, file=sys.stderr, **kwargs)
 
@@ -25,16 +31,33 @@ def get_home_dir() -> str:
     return home
 
 
-def read_auth_file() -> Dict[str, Any] | None:
+def get_chatgpt_local_home_dir() -> str:
+    home = os.getenv("CHATGPT_LOCAL_HOME")
+    if not home:
+        home = os.path.expanduser("~/.chatgpt-local")
+    return home
+
+
+def _auth_path(base: str) -> str:
+    return os.path.join(base, _AUTH_FILENAME)
+
+
+def _legacy_auth_search_paths() -> List[str]:
+    paths: List[str] = []
     for base in [
         os.getenv("CHATGPT_LOCAL_HOME"),
         os.getenv("CODEX_HOME"),
         os.path.expanduser("~/.chatgpt-local"),
         os.path.expanduser("~/.codex"),
     ]:
-        if not base:
-            continue
-        path = os.path.join(base, "auth.json")
+        if isinstance(base, str) and base and base not in paths:
+            paths.append(base)
+    return paths
+
+
+def read_auth_file() -> Dict[str, Any] | None:
+    for base in _legacy_auth_search_paths():
+        path = _auth_path(base)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -45,6 +68,17 @@ def read_auth_file() -> Dict[str, Any] | None:
     return None
 
 
+def read_chatgpt_local_auth_file() -> Dict[str, Any] | None:
+    path = _auth_path(get_chatgpt_local_home_dir())
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
 def write_auth_file(auth: Dict[str, Any]) -> bool:
     home = get_home_dir()
     try:
@@ -52,7 +86,7 @@ def write_auth_file(auth: Dict[str, Any]) -> bool:
     except Exception as exc:
         eprint(f"ERROR: unable to create auth home directory {home}: {exc}")
         return False
-    path = os.path.join(home, "auth.json")
+    path = _auth_path(home)
     try:
         with open(path, "w", encoding="utf-8") as fp:
             if hasattr(os, "fchmod"):
@@ -63,6 +97,149 @@ def write_auth_file(auth: Dict[str, Any]) -> bool:
         eprint(f"ERROR: unable to write auth file: {exc}")
         return False
 
+
+def write_chatgpt_local_auth_file(auth: Dict[str, Any]) -> bool:
+    home = get_chatgpt_local_home_dir()
+    try:
+        os.makedirs(home, exist_ok=True)
+    except Exception as exc:
+        eprint(f"ERROR: unable to create auth home directory {home}: {exc}")
+        return False
+    path = _auth_path(home)
+    try:
+        with open(path, "w", encoding="utf-8") as fp:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fp.fileno(), 0o600)
+            json.dump(auth, fp, indent=2)
+        return True
+    except Exception as exc:
+        eprint(f"ERROR: unable to write auth file: {exc}")
+        return False
+
+
+def _is_multi_profile_auth(auth: Any) -> bool:
+    return (
+        isinstance(auth, dict)
+        and auth.get("version") == _AUTH_VERSION
+        and isinstance(auth.get("profiles"), dict)
+    )
+
+
+def _coerce_profile_name(profile_name: str | None) -> str | None:
+    if not isinstance(profile_name, str):
+        return None
+    name = profile_name.strip()
+    return name or None
+
+
+def _normalize_profile_bundle(bundle: Any) -> Dict[str, Any] | None:
+    if not isinstance(bundle, dict):
+        return None
+    tokens = bundle.get("tokens") if isinstance(bundle.get("tokens"), dict) else None
+    if not isinstance(tokens, dict):
+        return None
+    return {
+        "OPENAI_API_KEY": bundle.get("OPENAI_API_KEY"),
+        "tokens": copy.deepcopy(tokens),
+        "last_refresh": bundle.get("last_refresh"),
+    }
+
+
+def _ensure_multi_profile_auth(auth: Dict[str, Any] | None) -> Dict[str, Any]:
+    if _is_multi_profile_auth(auth):
+        profiles = auth.get("profiles") if isinstance(auth.get("profiles"), dict) else {}
+        active_profile = _coerce_profile_name(auth.get("active_profile")) or _DEFAULT_PROFILE
+        normalized_profiles: Dict[str, Any] = {}
+        for name, bundle in profiles.items():
+            profile = _coerce_profile_name(name)
+            normalized = _normalize_profile_bundle(bundle)
+            if profile and normalized is not None:
+                normalized_profiles[profile] = normalized
+        if active_profile not in normalized_profiles and normalized_profiles:
+            active_profile = next(iter(normalized_profiles.keys()))
+        return {
+            "version": _AUTH_VERSION,
+            "active_profile": active_profile,
+            "profiles": normalized_profiles,
+        }
+
+    normalized = _normalize_profile_bundle(auth)
+    profiles = {_DEFAULT_PROFILE: normalized} if normalized is not None else {}
+    active_profile = _DEFAULT_PROFILE if profiles else _DEFAULT_PROFILE
+    return {
+        "version": _AUTH_VERSION,
+        "active_profile": active_profile,
+        "profiles": profiles,
+    }
+
+
+def list_auth_profiles(auth: Dict[str, Any] | None = None) -> List[str]:
+    source = auth if auth is not None else read_chatgpt_local_auth_file()
+    if not _is_multi_profile_auth(source):
+        return []
+    profiles = source.get("profiles") if isinstance(source.get("profiles"), dict) else {}
+    out = []
+    for name, bundle in profiles.items():
+        if _coerce_profile_name(name) and _normalize_profile_bundle(bundle) is not None:
+            out.append(name)
+    return sorted(out)
+
+
+def get_active_profile_name(auth: Dict[str, Any] | None = None) -> str | None:
+    source = auth if auth is not None else read_chatgpt_local_auth_file()
+    if not _is_multi_profile_auth(source):
+        return None
+    active = _coerce_profile_name(source.get("active_profile"))
+    profiles = source.get("profiles") if isinstance(source.get("profiles"), dict) else {}
+    if active and isinstance(profiles.get(active), dict):
+        return active
+    for name in profiles.keys():
+        if _coerce_profile_name(name):
+            return name
+    return None
+
+
+def get_auth_profile(auth: Dict[str, Any] | None, profile_name: str | None = None) -> Dict[str, Any] | None:
+    if _is_multi_profile_auth(auth):
+        profiles = auth.get("profiles") if isinstance(auth.get("profiles"), dict) else {}
+        effective_profile = _coerce_profile_name(profile_name) or get_active_profile_name(auth)
+        if not effective_profile:
+            return None
+        return _normalize_profile_bundle(profiles.get(effective_profile))
+    if profile_name is not None:
+        return None
+    return _normalize_profile_bundle(auth)
+
+
+def write_auth_profile(profile_name: str, auth_bundle: Dict[str, Any], *, set_active: bool = False) -> bool:
+    profile = _coerce_profile_name(profile_name)
+    normalized = _normalize_profile_bundle(auth_bundle)
+    if not profile or normalized is None:
+        return False
+    existing = read_chatgpt_local_auth_file()
+    container = _ensure_multi_profile_auth(existing)
+    profiles = container.get("profiles") if isinstance(container.get("profiles"), dict) else {}
+    profiles[profile] = normalized
+    container["profiles"] = profiles
+    if set_active or not _coerce_profile_name(container.get("active_profile")):
+        container["active_profile"] = profile
+    return write_chatgpt_local_auth_file(container)
+
+
+def set_active_profile(profile_name: str) -> bool:
+    profile = _coerce_profile_name(profile_name)
+    if not profile:
+        return False
+    existing = read_chatgpt_local_auth_file()
+    if not _is_multi_profile_auth(existing):
+        return False
+    profiles = existing.get("profiles") if isinstance(existing.get("profiles"), dict) else {}
+    if not isinstance(profiles.get(profile), dict):
+        return False
+    updated = dict(existing)
+    updated["active_profile"] = profile
+    return write_chatgpt_local_auth_file(updated)
+    
 
 def parse_jwt_claims(token: str) -> Dict[str, Any] | None:
     if not token or token.count(".") != 2:
@@ -219,8 +396,14 @@ def convert_tools_chat_to_responses(tools: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def load_chatgpt_tokens(ensure_fresh: bool = True) -> tuple[str | None, str | None, str | None]:
-    auth = read_auth_file()
+def load_chatgpt_tokens(ensure_fresh: bool = True, profile_name: str | None = None) -> tuple[str | None, str | None, str | None]:
+    requested_profile = _coerce_profile_name(profile_name)
+    chatgpt_local_auth = read_chatgpt_local_auth_file()
+    using_multi_profile = _is_multi_profile_auth(chatgpt_local_auth)
+    effective_profile = requested_profile or get_active_profile_name(chatgpt_local_auth)
+
+    auth_source = chatgpt_local_auth if using_multi_profile else read_auth_file()
+    auth = get_auth_profile(auth_source, effective_profile)
     if not isinstance(auth, dict):
         return None, None, None
 
@@ -251,7 +434,11 @@ def load_chatgpt_tokens(ensure_fresh: bool = True) -> tuple[str | None, str | No
                 if isinstance(account_id, str) and account_id:
                     updated_tokens["account_id"] = account_id
 
-                persisted = _persist_refreshed_auth(auth, updated_tokens)
+                persisted = _persist_refreshed_auth(
+                    auth_source,
+                    updated_tokens,
+                    profile_name=(effective_profile if using_multi_profile else None),
+                )
                 if persisted is not None:
                     auth, tokens = persisted
                 else:
@@ -329,10 +516,34 @@ def _refresh_chatgpt_tokens(refresh_token: str, client_id: str) -> Optional[Dict
     }
 
 
-def _persist_refreshed_auth(auth: Dict[str, Any], updated_tokens: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+def _persist_refreshed_auth(
+    auth: Dict[str, Any],
+    updated_tokens: Dict[str, Any],
+    profile_name: str | None = None,
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    last_refresh = _now_iso8601()
+    profile = _coerce_profile_name(profile_name)
+    if profile is not None:
+        container = _ensure_multi_profile_auth(read_chatgpt_local_auth_file())
+        profiles = container.get("profiles") if isinstance(container.get("profiles"), dict) else {}
+        existing_profile = get_auth_profile(container, profile)
+        if existing_profile is None:
+            return None
+        updated_profile = dict(existing_profile)
+        updated_profile["tokens"] = updated_tokens
+        updated_profile["last_refresh"] = last_refresh
+        profiles[profile] = updated_profile
+        container["profiles"] = profiles
+        if not _coerce_profile_name(container.get("active_profile")):
+            container["active_profile"] = profile
+        if write_chatgpt_local_auth_file(container):
+            return updated_profile, updated_tokens
+        eprint("ERROR: unable to persist refreshed auth tokens")
+        return None
+
     updated_auth = dict(auth)
     updated_auth["tokens"] = updated_tokens
-    updated_auth["last_refresh"] = _now_iso8601()
+    updated_auth["last_refresh"] = last_refresh
     if write_auth_file(updated_auth):
         return updated_auth, updated_tokens
     eprint("ERROR: unable to persist refreshed auth tokens")
@@ -367,8 +578,34 @@ def _now_iso8601() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def get_effective_chatgpt_auth() -> tuple[str | None, str | None]:
-    access_token, account_id, id_token = load_chatgpt_tokens()
+def get_effective_profile_name(profile_name: str | None = None) -> str | None:
+    requested_profile = _coerce_profile_name(profile_name)
+    chatgpt_local_auth = read_chatgpt_local_auth_file()
+    if not _is_multi_profile_auth(chatgpt_local_auth):
+        return None
+    if requested_profile is not None:
+        return requested_profile if get_auth_profile(chatgpt_local_auth, requested_profile) is not None else None
+    return get_active_profile_name(chatgpt_local_auth)
+
+
+def get_auth_context(profile_name: str | None = None) -> str:
+    effective_profile = get_effective_profile_name(profile_name)
+    if effective_profile is not None:
+        return f"profile:{effective_profile}"
+    auth = get_auth_profile(read_auth_file())
+    if isinstance(auth, dict):
+        tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+        account_id = tokens.get("account_id") if isinstance(tokens.get("account_id"), str) else None
+        if not account_id:
+            id_token = tokens.get("id_token") if isinstance(tokens.get("id_token"), str) else None
+            account_id = _derive_account_id(id_token)
+        if isinstance(account_id, str) and account_id:
+            return f"account:{account_id}"
+    return "anonymous"
+
+
+def get_effective_chatgpt_auth(profile_name: str | None = None) -> tuple[str | None, str | None]:
+    access_token, account_id, id_token = load_chatgpt_tokens(profile_name=profile_name)
     if not account_id:
         account_id = _derive_account_id(id_token)
     return access_token, account_id

@@ -20,7 +20,11 @@ from .reasoning import (
 )
 from .transform import convert_ollama_messages, normalize_ollama_tools
 from .upstream import normalize_model_name, start_upstream_request
-from .utils import convert_chat_messages_to_responses_input, convert_tools_chat_to_responses
+from .utils import (
+    convert_chat_messages_to_responses_input,
+    convert_tools_chat_to_responses,
+    get_effective_profile_name,
+)
 
 
 ollama_bp = Blueprint("ollama", __name__)
@@ -293,7 +297,7 @@ def ollama_chat() -> Response:
                 pass
         return error_resp
 
-    record_rate_limits_from_response(upstream)
+    record_rate_limits_from_response(upstream, profile_name=get_effective_profile_name(current_app.config.get("AUTH_PROFILE")))
 
     if upstream.status_code >= 400:
         try:

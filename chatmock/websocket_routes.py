@@ -22,7 +22,7 @@ from .session import (
     prepare_responses_request_for_session,
 )
 from .upstream import build_upstream_headers, build_upstream_websocket_url
-from .utils import get_effective_chatgpt_auth
+from .utils import get_auth_context, get_effective_chatgpt_auth
 
 
 def _log_json(prefix: str, payload: Any) -> None:
@@ -71,6 +71,8 @@ def register_websocket_routes(sock: Sock) -> None:
     @sock.route("/v1/responses")
     def responses_websocket(ws) -> None:
         verbose = bool(current_app.config.get("VERBOSE"))
+        auth_profile = current_app.config.get("AUTH_PROFILE") if isinstance(current_app.config.get("AUTH_PROFILE"), str) else None
+        auth_context = get_auth_context(auth_profile)
         upstream_ws = None
         upstream_session_id: str | None = None
         active_session_id: str | None = None
@@ -117,6 +119,7 @@ def register_websocket_routes(sock: Sock) -> None:
                             payload,
                             config=current_app.config,
                             client_session_id=client_session_id,
+                            auth_context=auth_context,
                         )
                     except ResponsesRequestError as exc:
                         _send_error(str(exc), status_code=exc.status_code, code=exc.code)
@@ -128,6 +131,7 @@ def register_websocket_routes(sock: Sock) -> None:
                         normalized.session_id,
                         normalized.payload,
                         allow_previous_response_id=True,
+                        auth_context=auth_context,
                     )
                     outbound_text = json.dumps(prepared.payload)
                     session_id = normalized.session_id
@@ -142,10 +146,10 @@ def register_websocket_routes(sock: Sock) -> None:
                     break
 
                 if upstream_ws is None or (session_id and session_id != upstream_session_id):
-                    access_token, account_id = get_effective_chatgpt_auth()
+                    access_token, account_id = get_effective_chatgpt_auth(profile_name=auth_profile)
                     if not access_token or not account_id:
                         if session_id:
-                            clear_responses_reuse_state(session_id)
+                            clear_responses_reuse_state(session_id, auth_context=auth_context)
                         _send_error(
                             "Missing ChatGPT credentials. Run 'python3 chatmock.py login' first.",
                             status_code=401,
@@ -171,7 +175,7 @@ def register_websocket_routes(sock: Sock) -> None:
                         )
                     except Exception as exc:
                         if session_id:
-                            clear_responses_reuse_state(session_id)
+                            clear_responses_reuse_state(session_id, auth_context=auth_context)
                         _send_error(
                             f"Upstream websocket connection failed: {exc}",
                             status_code=502,
@@ -186,12 +190,12 @@ def register_websocket_routes(sock: Sock) -> None:
                         upstream_message = upstream_ws.recv()
                     except ConnectionClosed:
                         if active_session_id:
-                            clear_responses_reuse_state(active_session_id)
+                            clear_responses_reuse_state(active_session_id, auth_context=auth_context)
                         _send_error("Upstream websocket closed unexpectedly.", status_code=502)
                         return
                     if upstream_message is None:
                         if active_session_id:
-                            clear_responses_reuse_state(active_session_id)
+                            clear_responses_reuse_state(active_session_id, auth_context=auth_context)
                         _send_error("Upstream websocket closed unexpectedly.", status_code=502)
                         return
                     if verbose:
@@ -206,7 +210,7 @@ def register_websocket_routes(sock: Sock) -> None:
                     except Exception:
                         parsed = None
                     if isinstance(parsed, dict) and active_session_id:
-                        note_responses_stream_event(active_session_id, parsed)
+                        note_responses_stream_event(active_session_id, parsed, auth_context=auth_context)
                     if _is_terminal_event(parsed):
                         if isinstance(parsed, dict) and parsed.get("type") in ("response.failed", "error"):
                             if upstream_ws is not None:

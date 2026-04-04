@@ -35,6 +35,8 @@ from .upstream import normalize_model_name, start_upstream_raw_request, start_up
 from .utils import (
     convert_chat_messages_to_responses_input,
     convert_tools_chat_to_responses,
+    get_auth_context,
+    get_effective_profile_name,
     sse_translate_chat,
     sse_translate_text,
 )
@@ -240,7 +242,7 @@ def chat_completions() -> Response:
                 pass
         return error_resp
 
-    record_rate_limits_from_response(upstream)
+    record_rate_limits_from_response(upstream, profile_name=get_effective_profile_name(current_app.config.get("AUTH_PROFILE")))
 
     created = int(time.time())
     if upstream.status_code >= 400:
@@ -475,7 +477,7 @@ def completions() -> Response:
                 pass
         return error_resp
 
-    record_rate_limits_from_response(upstream)
+    record_rate_limits_from_response(upstream, profile_name=get_effective_profile_name(current_app.config.get("AUTH_PROFILE")))
 
     created = int(time.time())
     if upstream.status_code >= 400:
@@ -574,6 +576,8 @@ def completions() -> Response:
 @openai_bp.route("/v1/responses", methods=["POST"])
 def responses_create() -> Response:
     verbose = bool(current_app.config.get("VERBOSE"))
+    auth_profile = get_effective_profile_name(current_app.config.get("AUTH_PROFILE"))
+    auth_context = get_auth_context(auth_profile)
     raw = request.get_data(cache=True, as_text=True) or ""
     if verbose:
         try:
@@ -600,6 +604,7 @@ def responses_create() -> Response:
             payload,
             config=current_app.config,
             client_session_id=extract_client_session_id(request.headers),
+            auth_context=auth_context,
         )
     except ResponsesRequestError as exc:
         err: Dict[str, Any] = {"error": {"message": str(exc)}}
@@ -616,6 +621,7 @@ def responses_create() -> Response:
         normalized.session_id,
         normalized.payload,
         allow_previous_response_id=False,
+        auth_context=auth_context,
     )
     stream_req = bool(prepared.payload.get("stream", False))
     upstream_payload = dict(prepared.payload)
@@ -626,7 +632,7 @@ def responses_create() -> Response:
         stream=True,
     )
     if error_resp is not None:
-        clear_responses_reuse_state(normalized.session_id)
+        clear_responses_reuse_state(normalized.session_id, auth_context=auth_context)
         if verbose:
             try:
                 body = error_resp.get_data(as_text=True)
@@ -640,7 +646,7 @@ def responses_create() -> Response:
                 pass
         return error_resp
 
-    record_rate_limits_from_response(upstream)
+    record_rate_limits_from_response(upstream, profile_name=get_effective_profile_name(current_app.config.get("AUTH_PROFILE")))
 
     if upstream.status_code >= 400:
         try:
@@ -649,7 +655,7 @@ def responses_create() -> Response:
             err_body = {"error": {"message": upstream.text or "Upstream error"}}
         finally:
             upstream.close()
-        clear_responses_reuse_state(normalized.session_id)
+        clear_responses_reuse_state(normalized.session_id, auth_context=auth_context)
         if verbose:
             _log_json("OUT POST /v1/responses", err_body)
         resp = make_response(jsonify(err_body), upstream.status_code)
@@ -664,7 +670,7 @@ def responses_create() -> Response:
             "STREAM OUT /v1/responses",
             stream_upstream_bytes(
                 upstream,
-                on_event=lambda evt: note_responses_stream_event(normalized.session_id, evt),
+                on_event=lambda evt: note_responses_stream_event(normalized.session_id, evt, auth_context=auth_context),
             ),
             verbose,
         )
@@ -687,7 +693,7 @@ def responses_create() -> Response:
         finally:
             upstream.close()
         if isinstance(body, dict):
-            note_responses_final_response(normalized.session_id, body)
+            note_responses_final_response(normalized.session_id, body, auth_context=auth_context)
             if verbose:
                 _log_json("OUT POST /v1/responses", body)
             resp = make_response(jsonify(body), upstream.status_code)
@@ -697,10 +703,10 @@ def responses_create() -> Response:
 
     response_obj, error_obj = aggregate_response_from_sse(
         upstream,
-        on_event=lambda evt: note_responses_stream_event(normalized.session_id, evt),
+        on_event=lambda evt: note_responses_stream_event(normalized.session_id, evt, auth_context=auth_context),
     )
     if error_obj is not None:
-        clear_responses_reuse_state(normalized.session_id)
+        clear_responses_reuse_state(normalized.session_id, auth_context=auth_context)
         if verbose:
             _log_json("OUT POST /v1/responses", error_obj)
         resp = make_response(jsonify(error_obj), 502)
@@ -709,7 +715,7 @@ def responses_create() -> Response:
         return resp
 
     if response_obj is None:
-        clear_responses_reuse_state(normalized.session_id)
+        clear_responses_reuse_state(normalized.session_id, auth_context=auth_context)
         err = {"error": {"message": "Upstream response stream did not contain a completed response object"}}
         if verbose:
             _log_json("OUT POST /v1/responses", err)

@@ -82,6 +82,7 @@ def normalize_responses_payload(
     *,
     config: Dict[str, Any],
     client_session_id: str | None = None,
+    auth_context: str = "anonymous",
 ) -> NormalizedResponsesRequest:
     requested_model = payload.get("model") if isinstance(payload.get("model"), str) else None
     normalized_model = normalize_model_name(requested_model, config.get("DEBUG_MODEL"))
@@ -142,7 +143,7 @@ def normalize_responses_payload(
     normalized.pop("fast_mode", None)
 
     input_items = _input_items_for_session(normalized.get("input"))
-    session_id = ensure_session_id(instructions, input_items, client_session_id)
+    session_id = ensure_session_id(instructions, input_items, client_session_id, auth_context=auth_context)
     prompt_cache_key = normalized.get("prompt_cache_key")
     if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
         normalized["prompt_cache_key"] = session_id

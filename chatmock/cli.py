@@ -12,7 +12,20 @@ from .app import create_app
 from .config import CLIENT_ID_DEFAULT
 from .limits import RateLimitWindow, compute_reset_at, load_rate_limit_snapshot
 from .oauth import OAuthHTTPServer, OAuthHandler, REQUIRED_PORT, URL_BASE
-from .utils import eprint, get_home_dir, load_chatgpt_tokens, parse_jwt_claims, read_auth_file
+from .utils import (
+    eprint,
+    get_active_profile_name,
+    get_auth_profile,
+    get_chatgpt_local_home_dir,
+    get_effective_profile_name,
+    get_home_dir,
+    list_auth_profiles,
+    load_chatgpt_tokens,
+    parse_jwt_claims,
+    read_auth_file,
+    read_chatgpt_local_auth_file,
+    set_active_profile,
+)
 
 
 _STATUS_LIMIT_BAR_SEGMENTS = 30
@@ -131,8 +144,37 @@ def _format_local_datetime(dt: datetime) -> str:
     return f"{local.strftime('%b %d, %Y %H:%M')} {tz_name}"
 
 
-def _print_usage_limits_block() -> None:
-    stored = load_rate_limit_snapshot()
+def _resolve_profile_name(profile_name: str | None) -> str | None:
+    if isinstance(profile_name, str) and profile_name.strip():
+        return profile_name.strip()
+    return get_effective_profile_name()
+
+
+def _account_summary(profile_name: str | None = None) -> dict[str, str | None] | None:
+    access_token, account_id, id_token = load_chatgpt_tokens(profile_name=profile_name)
+    if not access_token or not id_token:
+        return None
+    id_claims = parse_jwt_claims(id_token) or {}
+    access_claims = parse_jwt_claims(access_token) or {}
+    email = id_claims.get("email") or id_claims.get("preferred_username") or "<unknown>"
+    plan_raw = (access_claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or "unknown"
+    plan_map = {
+        "plus": "Plus",
+        "pro": "Pro",
+        "free": "Free",
+        "team": "Team",
+        "enterprise": "Enterprise",
+    }
+    plan = plan_map.get(str(plan_raw).lower(), str(plan_raw).title() if isinstance(plan_raw, str) else "Unknown")
+    return {
+        "email": email,
+        "plan": plan,
+        "account_id": account_id,
+    }
+
+
+def _print_usage_limits_block(profile_name: str | None = None) -> None:
+    stored = load_rate_limit_snapshot(profile_name=profile_name)
     
     print("📊 Usage Limits")
     
@@ -186,7 +228,7 @@ def _print_usage_limits_block() -> None:
 
     print()
 
-def cmd_login(no_browser: bool, verbose: bool) -> int:
+def cmd_login(no_browser: bool, verbose: bool, profile_name: str | None = None) -> int:
     home_dir = get_home_dir()
     client_id = CLIENT_ID_DEFAULT
     if not client_id:
@@ -195,7 +237,7 @@ def cmd_login(no_browser: bool, verbose: bool) -> int:
 
     try:
         bind_host = os.getenv("CHATGPT_LOCAL_LOGIN_BIND", "127.0.0.1")
-        httpd = OAuthHTTPServer((bind_host, REQUIRED_PORT), OAuthHandler, home_dir=home_dir, client_id=client_id, verbose=verbose)
+        httpd = OAuthHTTPServer((bind_host, REQUIRED_PORT), OAuthHandler, home_dir=home_dir, client_id=client_id, profile_name=profile_name, verbose=verbose)
     except OSError as e:
         eprint(f"ERROR: {e}")
         if e.errno == errno.EADDRINUSE:
@@ -259,6 +301,69 @@ def cmd_login(no_browser: bool, verbose: bool) -> int:
         return httpd.exit_code
 
 
+def cmd_accounts_list() -> int:
+    auth = read_chatgpt_local_auth_file()
+    profiles = list_auth_profiles(auth)
+    active_profile = get_active_profile_name(auth)
+    home_dir = get_chatgpt_local_home_dir()
+    print(f"Profiles home: {home_dir}")
+    if not profiles:
+        print("No chatgpt-local profiles found.")
+        return 0
+    print("")
+    for profile in profiles:
+        summary = _account_summary(profile)
+        marker = "*" if profile == active_profile else " "
+        print(f"{marker} {profile}")
+        if summary is None:
+            print("  • Not signed in")
+            continue
+        print(f"  • Login: {summary['email']}")
+        print(f"  • Plan: {summary['plan']}")
+        if summary.get("account_id"):
+            print(f"  • Account ID: {summary['account_id']}")
+    return 0
+
+
+def cmd_accounts_use(profile_name: str) -> int:
+    if set_active_profile(profile_name):
+        print(f"Active profile: {profile_name}")
+        return 0
+    eprint(f"ERROR: profile not found: {profile_name}")
+    return 1
+
+
+def cmd_info(profile_name: str | None = None, json_output: bool = False) -> int:
+    resolved_profile = _resolve_profile_name(profile_name)
+    if json_output:
+        if resolved_profile is not None:
+            auth = get_auth_profile(read_chatgpt_local_auth_file(), resolved_profile)
+        else:
+            auth = read_auth_file()
+        print(json.dumps(auth or {}, indent=2))
+        return 0
+
+    summary = _account_summary(resolved_profile)
+    print("👤 Account")
+    if summary is None:
+        print("  • Not signed in")
+        print("  • Run: python3 chatmock.py login")
+        print("")
+        _print_usage_limits_block(resolved_profile)
+        return 0
+
+    if resolved_profile is not None:
+        print(f"  • Profile: {resolved_profile}")
+    print("  • Signed in with ChatGPT")
+    print(f"  • Login: {summary['email']}")
+    print(f"  • Plan: {summary['plan']}")
+    if summary.get("account_id"):
+        print(f"  • Account ID: {summary['account_id']}")
+    print("")
+    _print_usage_limits_block(resolved_profile)
+    return 0
+
+
 def cmd_serve(
     host: str,
     port: int,
@@ -271,6 +376,7 @@ def cmd_serve(
     debug_model: str | None,
     expose_reasoning_models: bool,
     default_web_search: bool,
+    profile_name: str | None = None,
 ) -> int:
     app = create_app(
         verbose=verbose,
@@ -282,6 +388,7 @@ def cmd_serve(
         debug_model=debug_model,
         expose_reasoning_models=expose_reasoning_models,
         default_web_search=default_web_search,
+        auth_profile=profile_name,
     )
 
     app.run(host=host, use_reloader=False, port=port, threaded=True)
@@ -295,6 +402,7 @@ def main() -> None:
     p_login = sub.add_parser("login", help="Authorize with ChatGPT and store tokens")
     p_login.add_argument("--no-browser", action="store_true", help="Do not open the browser automatically")
     p_login.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    p_login.add_argument("--profile", help="Store login under a named chatgpt-local profile")
 
     p_serve = sub.add_parser("serve", help="Run local OpenAI-compatible server")
     p_serve.add_argument("--host", default="127.0.0.1")
@@ -356,14 +464,22 @@ def main() -> None:
             "Also configurable via CHATGPT_LOCAL_ENABLE_WEB_SEARCH."
         ),
     )
+    p_serve.add_argument("--profile", help="Use a named chatgpt-local profile for this server process")
 
     p_info = sub.add_parser("info", help="Print current stored tokens and derived account id")
     p_info.add_argument("--json", action="store_true", help="Output raw auth.json contents")
+    p_info.add_argument("--profile", help="Read a named chatgpt-local profile without changing the active profile")
+
+    p_accounts = sub.add_parser("accounts", help="Manage chatgpt-local profiles")
+    accounts_sub = p_accounts.add_subparsers(dest="accounts_command", required=True)
+    accounts_sub.add_parser("list", help="List chatgpt-local profiles")
+    p_accounts_use = accounts_sub.add_parser("use", help="Set the active chatgpt-local profile")
+    p_accounts_use.add_argument("profile")
 
     args = parser.parse_args()
 
     if args.command == "login":
-        sys.exit(cmd_login(no_browser=args.no_browser, verbose=args.verbose))
+        sys.exit(cmd_login(no_browser=args.no_browser, verbose=args.verbose, profile_name=args.profile))
     elif args.command == "serve":
         sys.exit(
             cmd_serve(
@@ -378,45 +494,17 @@ def main() -> None:
                 debug_model=args.debug_model,
                 expose_reasoning_models=args.expose_reasoning_models,
                 default_web_search=args.enable_web_search,
+                profile_name=args.profile,
             )
         )
     elif args.command == "info":
-        auth = read_auth_file()
-        if getattr(args, "json", False):
-            print(json.dumps(auth or {}, indent=2))
-            sys.exit(0)
-        access_token, account_id, id_token = load_chatgpt_tokens()
-        if not access_token or not id_token:
-            print("👤 Account")
-            print("  • Not signed in")
-            print("  • Run: python3 chatmock.py login")
-            print("")
-            _print_usage_limits_block()
-            sys.exit(0)
-
-        id_claims = parse_jwt_claims(id_token) or {}
-        access_claims = parse_jwt_claims(access_token) or {}
-
-        email = id_claims.get("email") or id_claims.get("preferred_username") or "<unknown>"
-        plan_raw = (access_claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type") or "unknown"
-        plan_map = {
-            "plus": "Plus",
-            "pro": "Pro",
-            "free": "Free",
-            "team": "Team",
-            "enterprise": "Enterprise",
-        }
-        plan = plan_map.get(str(plan_raw).lower(), str(plan_raw).title() if isinstance(plan_raw, str) else "Unknown")
-
-        print("👤 Account")
-        print("  • Signed in with ChatGPT")
-        print(f"  • Login: {email}")
-        print(f"  • Plan: {plan}")
-        if account_id:
-            print(f"  • Account ID: {account_id}")
-        print("")
-        _print_usage_limits_block()
-        sys.exit(0)
+        sys.exit(cmd_info(profile_name=args.profile, json_output=args.json))
+    elif args.command == "accounts":
+        if args.accounts_command == "list":
+            sys.exit(cmd_accounts_list())
+        if args.accounts_command == "use":
+            sys.exit(cmd_accounts_use(args.profile))
+        parser.error("Unknown accounts command")
     else:
         parser.error("Unknown command")
 
